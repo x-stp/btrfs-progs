@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <kernel-lib/overflow.h>
 #include "kernel-shared/uapi/btrfs_tree.h"
 #include "kernel-shared/uapi/btrfs.h"
 #include "kernel-shared/send.h"
@@ -75,6 +76,8 @@ static int read_buf(struct btrfs_send_stream *sctx, char *buf, size_t len)
 
 		rbytes = read(sctx->fd, buf + pos, len - pos);
 		if (rbytes < 0) {
+			if (errno == EINTR)
+				continue;
 			ret = -errno;
 			error("read from stream failed: %m");
 			goto out;
@@ -134,7 +137,11 @@ static int read_cmd(struct btrfs_send_stream *sctx)
 	cmd_hdr = (struct btrfs_cmd_header *)sctx->read_buf;
 	cmd_len = get_unaligned_le32(&cmd_hdr->len);
 	cmd = get_unaligned_le16(&cmd_hdr->cmd);
-	buf_len = sizeof(*cmd_hdr) + cmd_len;
+	if (check_add_overflow(sizeof(*cmd_hdr), (size_t)cmd_len, &buf_len)) {
+		ret = -EOVERFLOW;
+		error("command length overflow");
+		goto out;
+	}
 	if (sctx->read_buf_size < buf_len) {
 		void *new_read_buf;
 
@@ -196,6 +203,11 @@ static int read_cmd(struct btrfs_send_stream *sctx)
 
 		pos += sizeof(tlv_type);
 		data += sizeof(tlv_type);
+		if (cmd_len < pos) {
+			error("send stream is truncated");
+			ret = -EINVAL;
+			goto out;
+		}
 		if (sctx->version >= 2 && tlv_type == BTRFS_SEND_A_DATA) {
 			send_attr->tlv_len = cmd_len - pos;
 		} else {
@@ -208,7 +220,7 @@ static int read_cmd(struct btrfs_send_stream *sctx)
 			pos += sizeof(__le16);
 			data += sizeof(__le16);
 		}
-		if (cmd_len - pos < send_attr->tlv_len) {
+		if (cmd_len < pos || cmd_len - pos < send_attr->tlv_len) {
 			error("send stream is truncated");
 			ret = -EINVAL;
 			goto out;
